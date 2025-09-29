@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md-sandbox
-# MAGIC # Explaining inferences to highlight PCB default
+# MAGIC # Evaluation
 # MAGIC
 # MAGIC <img src="https://github.com/databricks-demos/dbdemos-resources/blob/main/images/product/computer-vision/deeplearning-cv-pcb-explainer.png?raw=true" width="500px" style="float: right"/>
 # MAGIC
@@ -19,8 +19,8 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-sdk==0.39.0 mlflow==2.20.2 shap==0.42.1 opencv-python==4.11.0.86 
-# MAGIC dbutils.library.restartPython()
+# MAGIC %pip install mlflow==3.3.1 shap==0.42.1 opencv-python==4.11.0.86 
+# MAGIC %restart_python
 
 # COMMAND ----------
 
@@ -113,7 +113,7 @@ explainer = shap.Explainer(hf_model_wrapper, masker_blur, output_names=class_nam
 def explain_image(image_to_explain, explainer, class_names):
   topk = 4
   batch_size = 50
-  n_evals = 10000
+  n_evals = 100
   # feed only one image
   # here we explain two images using 100 evaluations of the underlying model to estimate the SHAP values
   shap_values = explainer(image_to_explain, max_evals=n_evals, batch_size=batch_size,

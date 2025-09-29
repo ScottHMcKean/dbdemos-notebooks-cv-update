@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md-sandbox
-# MAGIC # Building a Computer Vision model with hugging face
+# MAGIC # Training (Serverless GPU)
 # MAGIC
 # MAGIC <img src="https://github.com/databricks-demos/dbdemos-resources/blob/main/images/product/computer-vision/deeplearning-cv-pcb-flow-4.png?raw=true" width="700px" style="float: right"/>
 # MAGIC
@@ -11,6 +11,9 @@
 # MAGIC
 # MAGIC Building such a model is greatly simplified by using the <a href="https://huggingface.co/docs/transformers/index">huggingface transformer library</a>.
 # MAGIC  
+# MAGIC <div style="background-color: #d9f0ff; border-radius: 10px; padding: 15px; margin: 10px 0; font-family: Arial, sans-serif;">
+# MAGIC   <strong>Note:</strong> This notebook has been tested on GPU accelerated (A10) serverless v3. <br/>
+# MAGIC </div>
 # MAGIC
 # MAGIC ## MLOps steps
 # MAGIC
@@ -29,8 +32,11 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-sdk==0.39.0 datasets==2.20.0 transformers==4.49.0 tf-keras==2.17.0 accelerate==1.4.0 mlflow==2.20.2 torchvision==0.20.1 deepspeed==0.14.4 evaluate==0.4.3
-# MAGIC dbutils.library.restartPython()
+# MAGIC %pip install datasets transformers accelerate mlflow torchvision evaluate --upgrade
+
+# COMMAND ----------
+
+# MAGIC %restart_python
 
 # COMMAND ----------
 
@@ -41,9 +47,8 @@
 
 # DBTITLE 1,Review our training dataset
 #Setup the training experiment
-DBDemos.init_experiment_for_batch("computer-vision-dl", "pcb")
-
-df = spark.read.table("training_dataset_augmented")
+DBDemos.init_experiment_for_batch("computer-vision", "pcb")
+df = spark.read.table(f"{CATALOG}.{SCHEMA}.images_gold")
 display(df.limit(10))
 
 # COMMAND ----------
@@ -57,11 +62,19 @@ display(df.limit(10))
 
 # COMMAND ----------
 
+dataset = datasets.Dataset.from_spark(
+    df,
+    cache_dir=f"/Volumes/{CATALOG}/{SCHEMA}/my-volume/train",
+    working_dir="/local_disk0/tmp/train"
+)
+
+# COMMAND ----------
+
 # DBTITLE 1,Create the transformer dataset from a spark dataframe (Delta Table)   
 from datasets import Dataset
 
 #Note: from_spark support coming with serverless compute - we'll use from_pandas for this simple demo having a small dataset
-#dataset = Dataset.from_spark(df), cache_dir="/tmp/hf_cache/train").rename_column("content", "image")
+# dataset = Dataset.from_spark(df), cache_dir="/tmp/hf_cache/train").rename_column("content", "image")
 dataset = Dataset.from_pandas(df.toPandas()).rename_column("content", "image")
 
 splits = dataset.train_test_split(test_size=0.2, seed = 42)
@@ -195,6 +208,7 @@ args = TrainingArguments(
 
 # DBTITLE 1,Define our evaluation metric
 import numpy as np
+import pandas as pd
 import evaluate
 # the compute_metrics function takes a Named Tuple as input:
 # predictions, which are the logits of the model as Numpy arrays,
@@ -248,11 +262,11 @@ with mlflow.start_run(run_name="hugging_face") as run:
     tokenizer = model_def, 
     device_map='auto')
   
-  #log the model to MLFlow
-  #    pip_requirements is optional, buit it is used to specify a custom set of dependencies
+  # log the model to MLFlow
+  # pip_requirements is optional, buit it is used to specify a custom set of dependencies
   reqs = mlflow.transformers.get_default_pip_requirements(model)
 
-  #    signature is used to specify the input and output schema.  Make a single prediction to get the output schema
+  # signature is used to specify the input and output schema.  Make a single prediction to get the output schema
   transform = ToPILImage()
   img = transform(val_ds[0]['image'])
   prediction = classifier(img)
@@ -260,19 +274,22 @@ with mlflow.start_run(run_name="hugging_face") as run:
     model_input=np.array(img), 
     model_output=pd.DataFrame(prediction))
   
-   #    log the model, set tags, and log metrics
-  mlflow.transformers.log_model(
-    artifact_path="model", 
+  # log the model, set tags, and log metrics
+  mlflow.transformers.log_model( 
     transformers_model=classifier, 
     pip_requirements=reqs,
-    signature=signature)
+    input_example=np.array(img)
+    )
   
+  # Set tags 
   mlflow.set_tag("dbdemos", "pcb_classification")
+  
+  # Log metric on training dataset at step and link to LoggedModel
   mlflow.log_metrics(train_results.metrics)
 
-  #    Log the input dataset for lineage tracking from table to model
+  # Log the input dataset for lineage tracking from table to model
   src_dataset = mlflow.data.load_delta(
-    table_name=f'{catalog}.{db}.training_dataset_augmented')
+    table_name=f'{CATALOG}.{SCHEMA}.images_gold')
   mlflow.log_input(src_dataset, context="Training-Input")
 
 # COMMAND ----------
@@ -311,7 +328,7 @@ test_image(damaged_samples, 0)
 # DBTITLE 1,Save the model in the registry & mark it for Production
 # Register models in Unity Catalog
 mlflow.set_registry_uri("databricks-uc")
-MODEL_NAME = f"{catalog}.{db}.dbdemos_pcb_classification"
+MODEL_NAME = f"{CATALOG}.{SCHEMA}.pcb_damage_clf"
 
 model_registered = mlflow.register_model("runs:/"+run.info.run_id+"/model", MODEL_NAME)
 print("registering model version "+model_registered.version+" as production model")
@@ -353,14 +370,3 @@ client.set_registered_model_alias(
 # MAGIC <img src="https://github.com/databricks-demos/dbdemos-resources/blob/main/images/product/computer-vision/deeplearning-cv-pcb-model-lineage.png?raw=true"/>
 # MAGIC
 # MAGIC Unity Catalog Lineage provides end-to-end visibility into how data flows and is consumed in your organization from raw ingestion all the way to model training.  Lineage data is available through [System Tables](https://docs.databricks.com/en/admin/system-tables/lineage.html) as well as the UI.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Next: Inference in batch and real-time 
-# MAGIC
-# MAGIC Our model is now trained and registered in MLflow Model Registry. Databricks mitigates the need for a lot of the anciliary code to train a model, so that you can focus on improving your model performance.
-# MAGIC
-# MAGIC The next step is now to use this model for inference - in batch or real-time behind a REST endpoint.
-# MAGIC
-# MAGIC Open the next [03-running-cv-inferences notebook]($./03-running-cv-inferences) to see how to leverage Databricks serving capabilities.

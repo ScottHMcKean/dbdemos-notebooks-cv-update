@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md-sandbox
-# MAGIC # Distributed Model training with torch lightning
+# MAGIC # Training (Distributed on Ray)
 # MAGIC
 # MAGIC In this demo, we will cover how to leverage Lightning to distribute our model training using multiple instances.
 # MAGIC
@@ -8,7 +8,6 @@
 # MAGIC
 # MAGIC This notebook is more advanced as the Hugging Face one, but gives you more control over the training.
 # MAGIC
-# MAGIC %md-sandbox
 # MAGIC <div style="background-color: #d9f0ff; border-radius: 10px; padding: 15px; margin: 10px 0; font-family: Arial, sans-serif;">
 # MAGIC   <strong>Note:</strong> This advanced deep learning content has been tailored to work on GPUs using Databricks Classic compute (not serverless). <br/>
 # MAGIC   We'll revisit this content soon to support the serverless AI runtime - stay tuned.
@@ -33,6 +32,21 @@
 # DBTITLE 1,Review our training dataset
 df = spark.read.table("training_dataset_augmented")
 display(df.limit(10))
+
+# COMMAND ----------
+
+#Force torch to local filestore to properly support serverless workspaces
+try:
+    import os
+    import tempfile
+    import torch
+
+    file_store_path = os.path.join(tempfile.gettempdir(), os.environ["VIRTUAL_ENV"].split("/")[-1])
+    store = torch.distributed.FileStore(file_store_path, world_size=1)
+    torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1, store=store)
+except:
+    print("Could not force PyTorch to local filestore")
+    pass
 
 # COMMAND ----------
 
@@ -64,6 +78,13 @@ test_path = f"/Volumes/{catalog}/{db}/{volume_name}/pcb_torch_delta/test"
 
 train.withColumn("id", row_number().over(w)).write.mode("overwrite").save(train_path)
 test.withColumn("id", row_number().over(w)).write.mode("overwrite").save(test_path)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Example code: lightning dataloader from hugging face dataset example
+# MAGIC
+# MAGIC If your dataset is small, you could also load it from your spark dataframe with the huggingface dataset library:
 
 # COMMAND ----------
 

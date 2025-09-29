@@ -1,23 +1,23 @@
 # Databricks notebook source
 # MAGIC %md-sandbox
-# MAGIC # Running inference at scale and in realtime
-# MAGIC
+# MAGIC # Inference
 # MAGIC
 # MAGIC <img src="https://github.com/databricks-demos/dbdemos-resources/blob/main/images/product/computer-vision/deeplearning-cv-pcb-flow-5.png?raw=true" width="700px" style="float: right"/>
 # MAGIC
-# MAGIC We have now deployed our model to our Registry. The registry provides governance and ACL, simplifying and accelerating all downstream pipeline developments.
+# MAGIC We now have a registered, validated, and evaluated model in Unity Catalog. It is now ready to be used for inference. This is typically done in two ways: 
 # MAGIC
-# MAGIC Other teams don't have to worry about the model itself, they can focus on Ops task & model serving, while Data Scientists can release new models when then feel ready. 
+# MAGIC 1. In Batch using a large cluster
+# MAGIC 2. Real-Time using a low-latency endpoint
 # MAGIC
-# MAGIC Models are typically used in 2 ways:
-# MAGIC
-# MAGIC - At scale, a cluster (in batch or streaming, including within Delta Live Tables)
-# MAGIC - For realtime, low-latencies use-cases, served behind a REST API.
-# MAGIC
-# MAGIC Databricks provides and simplify both options.
+# MAGIC Databricks and MLflow simplifies both options.
 # MAGIC
 # MAGIC <!-- Collect usage data (view). Remove it to disable collection. View README for more details.  -->
 # MAGIC <img width="1px" src="https://www.google-analytics.com/collect?v=1&gtm=GTM-NKQ8TT7&tid=UA-163989034-1&cid=555&aip=1&t=event&ec=field_demos&ea=display&dp=%2F42_field_demos%2Ffeatures%2Fcomputer-vision-dl%2Finferences&dt=ML">
+
+# COMMAND ----------
+
+# DBTITLE 1,Init the demo
+# MAGIC %run ./_resources/00-init $reset_all_data=false
 
 # COMMAND ----------
 
@@ -29,16 +29,6 @@
 # MAGIC To do so, we need to load our model from the MLFlow registry, and build a Pandas UDF to distribute the inference on multiple instances (typically on GPUs).
 # MAGIC
 # MAGIC The first step consist on installing the model dependencies to make sure we're loading the model using the same librairies versions.
-
-# COMMAND ----------
-
-# MAGIC %pip install databricks-sdk==0.39.0 mlflow==2.20.2
-# MAGIC dbutils.library.restartPython()
-
-# COMMAND ----------
-
-# DBTITLE 1,Init the demo
-# MAGIC %run ./_resources/00-init $reset_all_data=false
 
 # COMMAND ----------
 
@@ -61,6 +51,10 @@ if not os.path.exists(requirements_path):
 
 # DBTITLE 1,Install the requirements
 # MAGIC %pip install -r $requirements_path
+
+# COMMAND ----------
+
+#TODO: There is an issue here with Serverless GPU versions clashing
 
 # COMMAND ----------
 
@@ -115,12 +109,12 @@ import torch
 from typing import Iterator
 
 #Only batch the inferences in our udf by 1000 as images can take some memory
-try:
-  spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", 1000)
-except:
-  pass
+# try:
+#   spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", 1000)
+# except:
+#   pass
 
-@pandas_udf("struct<score: float, label: string>")
+@udf("struct<score: float, label: string>")
 def detect_damaged_pcb(images_iter: Iterator[pd.Series]) -> Iterator[pd.DataFrame]:
   #Switch pipeline to eval mode
   pipeline.model.eval()
@@ -130,7 +124,7 @@ def detect_damaged_pcb(images_iter: Iterator[pd.Series]) -> Iterator[pd.DataFram
 
 # COMMAND ----------
 
-display(df.limit(3).select('filename', 'content').withColumn("prediction", detect_damaged_pcb("content")))
+display(df.repartition(1000).limit(1).select('filename', 'content').withColumn("prediction", detect_damaged_pcb("content")))
 
 # COMMAND ----------
 
@@ -200,26 +194,28 @@ display(predictions)
 
 # COMMAND ----------
 
+#TODO: Profile networking and inference time
+
+# COMMAND ----------
+
 # DBTITLE 1,Save or RT model taking base64 in the registry
-from mlflow.models.signature import infer_signature
 DBDemos.init_experiment_for_batch("computer-vision-dl", "pcb")
 
 with mlflow.start_run(run_name="hugging_face_rt") as run:
-  signature = infer_signature(df_input, predictions)
-  #log the model to MLFlow
-  reqs = mlflow.pyfunc.log_model(
-    artifact_path="model", 
+  #log and register the model to MLFlow
+  reqs = mlflow.pyfunc.log_model( 
+    name='dbdemos_pcb_classification_rt',
     python_model=rt_model, 
     pip_requirements=requirements_path, 
-    input_example=df_input, 
-    signature = signature)
+    input_example=df_input,
+    registered_model_name=f"{catalog}.{db}.dbdemos_pcb_classification_rt"
+    )
   mlflow.set_tag("dbdemos", "pcb_classification")
   mlflow.set_tag("rt", "true")
 
-#Save the model in the registry
-model_registered = mlflow.register_model(
-  model_uri="runs:/"+run.info.run_id+"/model", 
-  name="dbdemos_pcb_classification")
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
@@ -231,61 +227,47 @@ model_registered = mlflow.register_model(
 
 # COMMAND ----------
 
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.serving import ServedEntityInput, EndpointCoreConfigInput, AutoCaptureConfigInput
-
-serving_endpoint_name = "dbdemos_pcb_classification_endpoint"
-
-# Specify the model serving endpoint configuration
-endpoint_config = EndpointCoreConfigInput(
-    name=serving_endpoint_name,
-    served_entities=[
-        ServedEntityInput(
-            entity_name=MODEL_NAME,
-            entity_version=model_registered.version,
-            workload_size="Small",
-            workload_type="CPU",
-            scale_to_zero_enabled=True
-        )
-    ],
-    auto_capture_config = AutoCaptureConfigInput(
-      catalog_name=catalog, 
-      schema_name=db, 
-      enabled=True)
-)
-
-#Set this to True to release a newer version (the demo won't update the endpoint to a newer model version by default)
-force_update = False 
-
-# Check existing endpoints to see if this one already exists
-w = WorkspaceClient()
-existing_endpoint = next(
-    (e for e in w.serving_endpoints.list() if e.name == serving_endpoint_name), None
-)
-if existing_endpoint == None:
-    print(f"Creating the endpoint {serving_endpoint_name}, this will take a few minutes to package and deploy the endpoint...")
-    from datetime import timedelta
-    w.serving_endpoints.create_and_wait(
-      name=serving_endpoint_name, 
-      config=endpoint_config, 
-      timeout=timedelta(minutes=60))
-else:
-  print(f"Endpoint {serving_endpoint_name} already exists...")
-  if force_update:
-    print(f"Updating the version of {endpoint_config.served_entities[0].entity_name} to version {endpoint_config.served_entities[0].entity_version} on endpoint {serving_endpoint_name}...")
-    from datetime import timedelta
-    w.serving_endpoints.update_config_and_wait(
-      served_entities=endpoint_config.served_entities, 
-      name=serving_endpoint_name,
-      timeout=timedelta(minutes=60))
+from mlflow.deployments import get_deploy_client
+from requests.exceptions import HTTPError
+client = get_deploy_client("databricks")
 
 # COMMAND ----------
 
-# MAGIC %md 
-# MAGIC ### Our endpoint is ready
+serving_endpoint_name = 'dbdemos_pcb_classification_endpoint'
+
+try: 
+  endpoint = client.get_endpoint(serving_endpoint_name)
+except HTTPError:
+  print('Serving Endpoint does not exist, registering new endpoint')
+  endpoint = client.create_endpoint(
+    name=serving_endpoint_name,
+    config={
+        "served_entities": [
+            {
+                "name": serving_endpoint_name+"-entity",
+                "entity_name": MODEL_NAME,
+                "entity_version": reqs.registered_model_version,
+                "workload_size": "Small",
+                "scale_to_zero_enabled": True
+            }
+        ],
+        "traffic_config": {
+            "routes": [
+                {
+                    "served_model_name": serving_endpoint_name+"-entity",
+                    "traffic_percentage": 100
+                }
+            ]
+        }
+    }
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Our endpoint is ready
 # MAGIC
 # MAGIC You can access and configure your endpoint using the [Model Serving UI](/#mlflow/endpoints/dbdemos_pcb_classification_endpoint) or the API. The Model Endpoint is serverless, stopping and starting almost instantly. In our case, we chose to scale it down to zero when not used (ideal for test/dev environements). 
-# MAGIC
 # MAGIC
 # MAGIC *Note that Databricks Model Serving lets you host multiple model versions, simplifying A/B testing and new model deployment.*
 
@@ -294,8 +276,6 @@ else:
 import timeit
 import mlflow
 from mlflow import deployments
-
-client = mlflow.deployments.get_deploy_client("databricks")
 
 for i in range(3):
     input_slice = df_input[2*i:2*i+2]
